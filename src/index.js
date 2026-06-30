@@ -175,6 +175,9 @@ export default {
       return stub.fetch(request);
     }
 
-    return env.ASSETS.fetch(request);
+    return new Response('Bingo WebSocket server is running.', {
+      status: 200,
+      headers: { 'content-type': 'text/plain;charset=UTF-8' }
+    });
   }
 };

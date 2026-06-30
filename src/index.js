@@ -1,7 +1,7 @@
 /**
- * Cloudflare Workers - オンラインビンゴサーバー (Durable Objects対応)
+ * Cloudflare Workers - オンラインビンゴサーバー (Durable Objects対応 & 安全な遅延タイムアウト)
  * * [デプロイ方法]
- * 1. wrangler.toml に以下の設定を追加します。
+ * wrangler.toml に以下の設定を追加します。
  * * name = "bingo-backend"
  * main = "worker.js"
  * compatibility_date = "2026-06-30"
@@ -11,7 +11,7 @@
  * * [[migrations]]
  * tag = "v1"
  * new_classes = ["BingoRoom"]
- * */
+ */
 
 export default {
   async fetch(request, env) {
@@ -40,15 +40,12 @@ export default {
         });
       }
 
-      // Durable ObjectのIDを一意のルームコードから生成または取得
       const id = env.BINGO_ROOM.idFromName(roomCode.toLowerCase());
       const stub = env.BINGO_ROOM.get(id);
 
-      // Durable Objectにリクエストを転送
       return stub.fetch(request);
     }
 
-    // インデックスまたはその他の無効なパス
     return new Response("Cloudflare Bingo API サーバーは正常に稼働しています。", {
       status: 200,
       headers: { 
@@ -61,20 +58,19 @@ export default {
 
 // =========================================================================
 // Durable Object: BingoRoom クラス
-// 各ビンゴルームの独立したリアルタイムステートと接続セッションを管理
 // =========================================================================
 export class BingoRoom {
   constructor(state, env) {
     this.state = state;
     this.sessions = []; // ルームに現在接続しているすべてのアクティブなセッション
     this.gameState = {
-      drawnNumbers: [], // 既に引かれた数字の配列
+      drawnNumbers: [], 
       users: {},       // セッションIDごとのユーザー情報: { [sessionId]: { name, isHost } }
       createdAt: Date.now(),
       lastActivity: Date.now()
     };
 
-    // 保存されている永続化状態を復元（再起動や退避への対策）
+    // 保存されている永続化状態を復元
     this.state.blockConcurrencyWhile(async () => {
       const stored = await this.state.storage.get("gameState");
       if (stored) {
@@ -84,7 +80,6 @@ export class BingoRoom {
   }
 
   async fetch(request) {
-    // WebSocketアップグレード要求の検証
     if (request.headers.get("Upgrade") !== "websocket") {
       return new Response("WebSocket接続を期待しています。", { 
         status: 426,
@@ -95,7 +90,6 @@ export class BingoRoom {
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
 
-    // 接続処理を開始
     await this.handleSession(server);
 
     return new Response(null, { 
@@ -108,7 +102,6 @@ export class BingoRoom {
   async handleSession(webSocket) {
     webSocket.accept();
 
-    // 接続ごとに一意のセッションIDを生成
     const sessionId = crypto.randomUUID();
     const session = { 
       webSocket, 
@@ -117,7 +110,7 @@ export class BingoRoom {
       isHost: false 
     };
 
-    // 最大参加人数を30名に制限するガードレール
+    // 接続上限30名制限
     if (this.sessions.length >= 30) {
       webSocket.send(JSON.stringify({ 
         type: "error", 
@@ -127,9 +120,11 @@ export class BingoRoom {
       return;
     }
 
+    // 新たに接続があったため、予定されているクリーンアップタイマー(アラーム)をキャンセル
+    await this.state.storage.deleteAlarm();
+
     this.sessions.push(session);
 
-    // メッセージ受信イベント
     webSocket.addEventListener("message", async (msg) => {
       try {
         const data = JSON.parse(msg.data);
@@ -137,7 +132,6 @@ export class BingoRoom {
 
         switch (data.type) {
           case "join":
-            // ルーム入室・初期化
             session.name = data.name || "プレイヤー";
             session.isHost = !!data.isHost;
 
@@ -146,10 +140,8 @@ export class BingoRoom {
               isHost: session.isHost 
             };
 
-            // 永続化ストレージに保存
             await this.state.storage.put("gameState", this.gameState);
 
-            // 全接続者へルーム最新状態をブロードキャスト
             this.broadcast({
               type: "state",
               drawnNumbers: this.gameState.drawnNumbers,
@@ -159,7 +151,6 @@ export class BingoRoom {
             break;
 
           case "draw":
-            // 数字の抽選処理 (ホスト権限チェック)
             if (session.isHost) {
               const num = parseInt(data.number, 10);
               if (num && num >= 1 && num <= 75 && !this.gameState.drawnNumbers.includes(num)) {
@@ -178,14 +169,12 @@ export class BingoRoom {
             break;
 
           case "kick_all":
-            // ホストによる全員の強制退出
             if (session.isHost) {
               this.broadcast({ 
                 type: "kick_all", 
-                message: "ホストにより全員が退出させられました。ゲームを終了します。" 
+                message: "ホストにより全員が退室させられました。ゲームを終了します。" 
               });
 
-              // すべての接続セッションを切断
               const activeSessions = [...this.sessions];
               this.sessions = [];
               
@@ -195,8 +184,9 @@ export class BingoRoom {
                 } catch (e) {}
               });
 
-              // ストレージから状態を削除
+              // ホスト自らがルームを完全に閉じたら即時消去
               await this.state.storage.delete("gameState");
+              await this.state.storage.deleteAlarm();
             }
             break;
         }
@@ -205,18 +195,20 @@ export class BingoRoom {
       }
     });
 
-    // 接続解除イベント
     webSocket.addEventListener("close", async () => {
       this.sessions = this.sessions.filter(s => s.id !== sessionId);
       delete this.gameState.users[sessionId];
 
-      // ルームに誰もいなくなった場合は、Durable Object内のデータもクリアして自動タイムアウト
+      // セッションが完全に0人（無人）になった場合
       if (this.sessions.length === 0) {
-        await this.state.storage.delete("gameState");
+        // 即座に消去するのではなく、30分間（1800000ms）のタイムアウト時間を設定し、自動でアラーム（クリーンアップ処理）をセット
+        const timeoutMs = 30 * 60 * 1000; // 30分
+        await this.state.storage.setAlarm(Date.now() + timeoutMs);
+        
+        await this.state.storage.put("gameState", this.gameState);
       } else {
         await this.state.storage.put("gameState", this.gameState);
         
-        // 残っているユーザーに通知
         this.broadcast({
           type: "state",
           drawnNumbers: this.gameState.drawnNumbers,
@@ -226,24 +218,25 @@ export class BingoRoom {
       }
     });
 
-    // エラーハンドリング
     webSocket.addEventListener("error", () => {
-      // 接続異常時も安全にセッションリストから削除
       this.sessions = this.sessions.filter(s => s.id !== sessionId);
     });
   }
 
-  // ルームに接続中の全員にメッセージを送信するヘルパー関数
+  // クリーンアップのアラーム処理がキックされたとき（30分間誰も接続しなかった場合）
+  async alarm() {
+    // 完全にルームデータをストレージから消去してクリーンアップします
+    await this.state.storage.delete("gameState");
+  }
+
   broadcast(message) {
     const payload = JSON.stringify(message);
     this.sessions.forEach(s => {
       try {
-        if (s.webSocket.readyState === 1) { // OPEN の場合のみ送信
+        if (s.webSocket.readyState === 1) { 
           s.webSocket.send(payload);
         }
-      } catch (err) {
-        console.error("ブロードキャスト中にエラーが発生しました: ", err);
-      }
+      } catch (err) {}
     });
   }
 }

@@ -1,3 +1,6 @@
+const INACTIVE_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+const EMPTY_ROOM_TIMEOUT_MS = 5 * 60 * 1000;
+
 export class BingoRoom {
   constructor(state, env) {
     this.state = state;
@@ -55,6 +58,20 @@ export class BingoRoom {
     });
   }
 
+  async resetInactiveAlarm() {
+    await this.state.storage.setAlarm(Date.now() + INACTIVE_TIMEOUT_MS);
+  }
+
+  async setEmptyRoomAlarm() {
+    await this.state.storage.setAlarm(Date.now() + EMPTY_ROOM_TIMEOUT_MS);
+  }
+
+  async alarm() {
+    this.drawnNumbers = [];
+    this.users = [];
+    await this.state.storage.deleteAll();
+  }
+
   async handleMessage(sessionId, data) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
@@ -89,6 +106,7 @@ export class BingoRoom {
       }
 
       await this.persist();
+      await this.resetInactiveAlarm();
 
       this.broadcast({
         type: 'state',
@@ -106,6 +124,7 @@ export class BingoRoom {
 
       this.drawnNumbers.push(num);
       await this.persist();
+      await this.resetInactiveAlarm();
 
       this.broadcast({
         type: 'draw',
@@ -142,6 +161,12 @@ export class BingoRoom {
     if (session && session.user) {
       this.users = this.users.filter(u => u.name !== session.user.name);
       await this.persist();
+
+      if (this.users.length === 0) {
+        await this.setEmptyRoomAlarm();
+      } else {
+        await this.resetInactiveAlarm();
+      }
 
       this.broadcast({
         type: 'state',

@@ -72,6 +72,15 @@ export class BingoRoom {
       const name = String(data.name || 'プレイヤー').slice(0, 15);
       const isHost = !!data.isHost;
 
+      if (!isHost && !this.users.some(u => u.isHost)) {
+        this.sendTo(session.webSocket, {
+          type: 'error',
+          message: 'ホストがいないルームには参加できません。ホストが先にルームを作成してください。'
+        });
+        session.webSocket.close();
+        return;
+      }
+
       session.user = { name, isHost };
 
       const existing = this.users.find(u => u.name === name);

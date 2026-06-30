@@ -1,15 +1,11 @@
 name = "online-bingo"
-main = "src/index.js"
+main = "src/worker.js"
 compatibility_date = "2024-09-23"
-
-[assets]
-directory = "./public"
-binding = "ASSETS"
 
 [[durable_objects.bindings]]
 name = "BINGO_ROOM"
 class_name = "BingoRoom"
 
 [[migrations]]
-tag = "v1"
+tag = "v2"
 new_sqlite_classes = ["BingoRoom"]
